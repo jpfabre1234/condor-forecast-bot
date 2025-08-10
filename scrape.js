@@ -299,7 +299,11 @@ async function postToMake(payload) {
 
     // 6) Hash & idempotency
     const fileHash = sha256(csvText);
-    const idempotencyKey = fileHash; // stable per file
+    const idempotencyKey =
+      process.env.BYPASS_DEDUPE === '1'
+        ? sha256(fileName + '|' + generatedAtUtc + '|' + Math.random())
+        : fileHash;
+
 
     // 7) Build payload for Make
     const payload = {
