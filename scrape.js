@@ -1,366 +1,345 @@
-import * as fs from 'fs';
-import * as path from 'path';
-import * as crypto from 'crypto';
+// scrape.js - Condor Forecast Bot
+// - Opens the portal (or uses DIRECT_CSV_URL)
+// - Gets latest CSV contents
+// - Parses rows { ts_utc, local, price }
+// - Computes flagged (first 24 >= threshold)
+// - Builds two lists for Telegram:
+//   * first 24 >= threshold (plain text)
+//   * full CSV view as lines with header (also MD code block)
+// - POSTs payload to Make webhook
+
 import { chromium } from 'playwright';
-import xlsx from 'xlsx';
-import fetch from 'node-fetch';
+import crypto from 'crypto';
 
-const env = (k, d = null) => process.env[k] ?? d;
+// ------------------------
+// Config (ENV overrides)
+// ------------------------
+const MAKE_WEBHOOK_URL = mustEnv('MAKE_WEBHOOK_URL');
 
-// REQUIRED
-let PORTAL_URL = env('PORTAL_URL'); // e.g. https://de.acespower.com
-if (PORTAL_URL && PORTAL_URL.startsWith('hhttps://')) PORTAL_URL = PORTAL_URL.replace('hhttps://', 'https://');
-const USERNAME = env('USERNAME', '');
-const PASSWORD = env('PASSWORD', '');
-const MAKE_WEBHOOK_URL = env('MAKE_WEBHOOK_URL');
+const DIRECT_CSV_URL   = process.env.DIRECT_CSV_URL || '';
+const PORTAL_URL       = process.env.PORTAL_URL     || '';
+const LINK_SELECTOR    = process.env.LINK_SELECTOR  || 'a[href$=".csv"], a[href$=".CSV"]';
 
-// OPTIONAL
-const TIMEZONE = env('TIMEZONE', 'America/Chicago');
-const PRICE_THRESHOLD = Number(env('PRICE_THRESHOLD', '80'));
-const HOURS_LOOKAHEAD = Number(env('HOURS_LOOKAHEAD', '6'));
+const PRICE_THRESHOLD  = Number(process.env.PRICE_THRESHOLD || '80');     // example default
+const SHEET_NAME       = process.env.SHEET_NAME || 'AMIL.WVPA';
+const TIMEZONE_LABEL   = process.env.TIMEZONE || 'America/Chicago';
 
-if (!PORTAL_URL || !MAKE_WEBHOOK_URL) {
-  console.error('Missing PORTAL_URL or MAKE_WEBHOOK_URL');
-  process.exit(2);
+// For pages that require selecting a row then clicking a download button.
+// (Your portal fits this pattern; leave blank if not needed.)
+const ROW_CHECKBOX_SELECTOR   = process.env.ROW_CHECKBOX_SELECTOR || '';  // e.g. 'tr:first-child td input[type="checkbox"]'
+const DOWNLOAD_BTN_SELECTOR   = process.env.DOWNLOAD_BTN_SELECTOR || '';  // e.g. 'button:has-text("Descargar")'
+
+// Debug
+const HEADLESS = (process.env.HEADLESS || 'true').toLowerCase() !== 'false';
+
+// Limit for Telegram inline code block (4096 hard cap – keep it safe)
+const MAX_TG_INLINE = 3000;
+
+// ------------------------
+// Utilities
+// ------------------------
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v) {
+    console.error(`Missing required env: ${name}`);
+    process.exit(1);
+  }
+  return v;
 }
 
-const sha256File = (fp) => {
-  const h = crypto.createHash('sha256');
-  h.update(fs.readFileSync(fp));
-  return h.digest('hex');
-};
-const toISOZ = (d) => new Date(d).toISOString();
-function toLocalISO(date, tz) {
-  try {
-    const fmt = new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
-    });
-    const parts = fmt.formatToParts(date);
-    const m = Object.fromEntries(parts.map(p => [p.type, p.value]));
-    return `${m.year}-${m.month}-${m.day}T${m.hour}:${m.minute}:${m.second}`;
-  } catch {
-    return new Date(date).toString();
-  }
+function sha256(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
 }
 
-// ---- Parsers ----
-function parseCSV_amil_wvpa(filePath) {
-  const raw = fs.readFileSync(filePath, 'utf8');
-  const lines = raw.split(/\r?\n/).filter(l => l.trim().length > 0);
-  const header = lines[0].split(',').map(s => s.trim().toLowerCase());
-  const idx = {
-    date: header.indexOf('date'),
-    he: header.indexOf('he'),
-    node: header.indexOf('node'),
-    forecast: header.indexOf('forecast'),
-    value: header.indexOf('value'),
-  };
-  if (idx.date === -1 || idx.he === -1 || (idx.forecast === -1 && idx.value === -1)) {
-    throw new Error(`CSV schema not recognized. Headers: ${header.join(', ')}`);
-  }
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function clip(s, keep = MAX_TG_INLINE) {
+  return s.length <= keep ? s : s.slice(0, keep) + '\n…(truncated)';
+}
+
+// CSV line splitter that handles basic quoted fields
+function splitCsvLine(line) {
   const out = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(',');
-    if (cols.length < 3) continue;
-    const dstr = (cols[idx.date] || '').trim();
-    const heStr = (cols[idx.he] || '').trim();
-    const priceStr = (cols[idx.forecast] || cols[idx.value] || '').trim();
-    if (!dstr || !heStr || !priceStr) continue;
-    const he = Number(heStr), price = Number(priceStr);
-    if (Number.isNaN(he) || Number.isNaN(price)) continue;
+  let cur = '';
+  let inQuotes = false;
 
-    // HE 1 -> 01:00 local, HE 24 -> next-day 00:00 local
-    const [Y, M, D] = dstr.split('-').map(Number);
-    const hrEnd = he % 24;
-    const addDays = he === 24 ? 1 : 0;
-    const tsUTC = new Date(Date.UTC(Y, M - 1, D + addDays, hrEnd, 0, 0)).toISOString();
-    out.push({ ts_utc: tsUTC, price });
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+
+    if (ch === '"') {
+      // doubled quote inside quoted field
+      if (inQuotes && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (ch === ',' && !inQuotes) {
+      out.push(cur);
+      cur = '';
+    } else {
+      cur += ch;
+    }
   }
-  out.sort((a, b) => a.ts_utc.localeCompare(b.ts_utc));
+  out.push(cur);
   return out;
 }
 
-function parseExcelFlexible(filePath) {
-  const wb = xlsx.readFile(filePath, { cellDates: true });
-  const s = wb.SheetNames[0];
-  const sh = wb.Sheets[s];
-  const rows = xlsx.utils.sheet_to_json(sh, { defval: null });
-  const tsKeys = ['Timestamp', 'Time', 'IntervalStart', 'Start', 'Hour', 'DATETIME', 'INTERVAL START', 'ts', 'time_utc'];
-  const priceKeys = ['Price', 'LMP', 'Value', 'PRICE', 'LMP ($/MWh)', 'forecast'];
-  let tsKey = rows[0] ? Object.keys(rows[0]).find(k => tsKeys.map(x => x.toLowerCase()).includes(k.toLowerCase())) : null;
-  let pKey = rows[0] ? Object.keys(rows[0]).find(k => priceKeys.map(x => x.toLowerCase()).includes(k.toLowerCase())) : null;
-  if (!tsKey || !pKey) throw new Error('Excel schema not recognized.');
-  return rows.map(r => {
-    const t = r[tsKey];
-    const d = (t instanceof Date) ? t : new Date(t);
-    return {
-      ts_utc: new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), 0, 0)).toISOString(),
-      price: Number(r[pKey]),
-    };
-  }).filter(x => !Number.isNaN(x.price));
-}
+// Parse CSV -> { header:[], rows: [] of objects keyed by header }
+function parseCsv(text) {
+  // handle BOM + normalize
+  let t = text.replace(/^\uFEFF/, '');
+  const lines = t.split(/\r?\n/).filter(l => l.trim().length > 0);
 
-// ---- Downloader: click newest filename; catch native download or AJAX blob ----
-async function downloadForecast() {
-  const tmpDir = '/tmp/condor_dl';
-  fs.mkdirSync(tmpDir, { recursive: true });
+  if (lines.length === 0) return { header: [], rows: [] };
 
-  const browser = await chromium.launch({ headless: true });
-  const ctx = await browser.newContext({ acceptDownloads: true });
-  const page = await ctx.newPage();
+  const header = splitCsvLine(lines[0]).map(h => h.trim());
+  const idxMap = new Map(header.map((h, i) => [h.toLowerCase(), i]));
 
-  // 1) Login
-  await page.goto(PORTAL_URL, { waitUntil: 'domcontentloaded', timeout: 120000 });
-  if (USERNAME && PASSWORD) {
-    try {
-      await page.waitForSelector("input[type='text'], input[name='username'], #username", { timeout: 8000 });
-      await page.fill("input[type='text'], input[name='username'], #username", USERNAME);
-      await page.fill("input[type='password'], #password", PASSWORD);
-      const btn = await page.$("button[type='submit'], input[type='submit'], button:has-text('Log in'), button:has-text('Sign in')");
-      if (btn) await btn.click();
-      await page.waitForLoadState('networkidle', { timeout: 120000 });
-    } catch { /* continue even if login UI differs */ }
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const parts = splitCsvLine(lines[i]);
+    const obj = {};
+    for (let c = 0; c < header.length; c++) obj[header[c]] = parts[c] ?? '';
+    rows.push(obj);
   }
 
-  // 2) Sniff CSV/XLSX network responses (AJAX blob fallback)
-  let sniffedPath = null;
-  page.on('response', async (resp) => {
-    try {
-      const headers = resp.headers();
-      const ct = (headers['content-type'] || '').toLowerCase();
-      const cd = headers['content-disposition'] || '';
-      const isFile = ct.includes('text/csv')
-        || ct.includes('application/vnd.ms-excel')
-        || ct.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      if (!isFile) return;
-      const body = await resp.body();
-      const m = /filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i.exec(cd);
-      const nameGuess = decodeURIComponent((m && (m[1] || m[2])) || 'download.csv');
-      const fp = path.join(tmpDir, nameGuess);
-      fs.writeFileSync(fp, body);
-      sniffedPath = fp;
-    } catch { /* ignore */ }
-  });
+  return { header, headerLowerIdx: idxMap, rows };
+}
 
-  await page.waitForTimeout(1500);
+function pickField(obj, headerIdx, name) {
+  const i = headerIdx.get(name.toLowerCase());
+  if (i == null) return undefined;
 
-  // 3) Find visible filenames (main page + iframes)
-  const fileRe = /AMIL\.WVPA_rt_price_forecast_(\d{14})\.csv$/i;
+  // Find actual header name at that position
+  const keys = Object.keys(obj);
+  const key = keys[i] ?? name;
+  return obj[key];
+}
 
-  async function namesIn(frameLike) {
-    try {
-      return await frameLike.$$eval('a, [role="link"], .file-name, td, span, div', els =>
-        Array.from(new Set(
-          els.map(e => (e.textContent || '').trim())
-             .filter(t => /AMIL\.WVPA_rt_price_forecast_\d{14}\.csv$/i.test(t))
-        ))
-      );
-    } catch {
-      return [];
+// Map CSV rows -> normalized { ts_utc, local, price }
+function normalizeRows(csv) {
+  const out = [];
+  for (const r of csv.rows) {
+    const ts_utc = pickField(r, csv.headerLowerIdx, 'ts_utc') ?? pickField(r, csv.headerLowerIdx, 'utc') ?? '';
+    const local  = pickField(r, csv.headerLowerIdx, 'local')  ?? pickField(r, csv.headerLowerIdx, 'local_time') ?? '';
+    const priceS = pickField(r, csv.headerLowerIdx, 'price')  ?? pickField(r, csv.headerLowerIdx, 'value') ?? '';
+    const price  = Number(String(priceS).replace(/,/g, '').trim());
+
+    // Skip if missing timestamp or price
+    if (!ts_utc || !isFinite(price)) continue;
+
+    out.push({ ts_utc, local, price });
+  }
+  return out;
+}
+
+function toLine(rec) {
+  const p = Number(rec.price);
+  return `${rec.ts_utc}, ${rec.local || ''}, ${isFinite(p) ? p.toFixed(2) : rec.price}`;
+}
+
+// ------------------------
+// Portal fetching helpers
+// ------------------------
+async function fetchCsvViaDirectUrl(context, url) {
+  const page = await context.newPage();
+  const resp = await page.goto(url, { waitUntil: 'domcontentloaded' });
+  if (!resp || !resp.ok()) throw new Error(`Failed to fetch CSV via DIRECT_CSV_URL (${resp && resp.status()})`);
+  const text = await resp.text();
+  await page.close();
+  return { text, fileName: inferFileNameFromUrl(url) };
+}
+
+function inferFileNameFromUrl(url) {
+  try {
+    const u = new URL(url);
+    const last = u.pathname.split('/').filter(Boolean).pop() || 'file.csv';
+    return decodeURIComponent(last);
+  } catch {
+    return 'file.csv';
+  }
+}
+
+async function fetchCsvFromPortal(context) {
+  if (!PORTAL_URL) throw new Error('No PORTAL_URL configured and DIRECT_CSV_URL is empty.');
+
+  const browserPage = await context.newPage();
+  await browserPage.goto(PORTAL_URL, { waitUntil: 'domcontentloaded' });
+
+  // Strategy A: a real <a href="*.csv"> link (LINK_SELECTOR)
+  const linkHandle = await browserPage.$(LINK_SELECTOR);
+  if (linkHandle) {
+    const href = await linkHandle.getAttribute('href');
+    if (href && /^https?:/i.test(href)) {
+      const fileName = inferFileNameFromUrl(href);
+      const res = await browserPage.request.get(href);
+      if (!res.ok()) throw new Error(`Failed to GET CSV link (${res.status()})`);
+
+      const text = await res.text();
+      await browserPage.close();
+      return { text, fileName };
     }
   }
 
-  const frames = [page, ...page.frames().filter(f => f !== page)];
-  let allNames = [];
-  for (const f of frames) allNames = allNames.concat(await namesIn(f));
-  allNames = Array.from(new Set(allNames));
+  // Strategy B: select row checkbox then click "Descargar" (portal UI like de.acespower.com)
+  if (ROW_CHECKBOX_SELECTOR && DOWNLOAD_BTN_SELECTOR) {
+    await browserPage.waitForTimeout(500); // slight settle
 
-  if (allNames.length === 0) {
-    await page.screenshot({ path: 'page.png', fullPage: true });
-    console.log('DEBUG_FILENAMES_BEGIN');
-    console.log(JSON.stringify({ frames: frames.length, names: allNames }, null, 2));
-    console.log('DEBUG_FILENAMES_END');
-    await browser.close();
-    throw new Error('No AMIL.WVPA_rt_price_forecast_YYYYMMDDHHMMSS.csv text found.');
-  }
+    const checkbox = await browserPage.$(ROW_CHECKBOX_SELECTOR);
+    if (!checkbox) throw new Error('Row checkbox not found. Adjust ROW_CHECKBOX_SELECTOR.');
+    await checkbox.click({ force: true });
 
-  // 4) Pick newest by timestamp
-  allNames.sort((a, b) => {
-    const na = Number((a.match(fileRe) || [])[1] || 0);
-    const nb = Number((b.match(fileRe) || [])[1] || 0);
-    return nb - na;
-  });
-  const targetName = allNames[0];
-  console.log(`Chosen file: ${targetName}`);
-
-  // 5) Click that exact text; capture native download or sniffed blob
- async function clickByExactText(frameLike) {
-  const name = targetName;
-
-  // find the text node (allowing extra whitespace/icon text)
-  const textNode = frameLike.locator(`xpath=//*[contains(normalize-space(.),"${name}")]`).first();
-  if (await textNode.count() === 0) return null;
-
-  // closest row-like container
-  const row = textNode.locator(
-    'xpath=ancestor-or-self::*[self::tr or @role="row" or contains(@class,"row") or contains(@class,"file")][1]'
-  );
-
-  // helper: wait for native download or fallback to sniffed AJAX
-  const saveFromAction = async (actionPromise) => {
-    const result = await Promise.race([
-      (async () => {
-        const dl = await page.waitForEvent('download', { timeout: 20000 });
-        const fp = path.join('/tmp/condor_dl', await dl.suggestedFilename());
-        await dl.saveAs(fp);
-        return fp;
-      })(),
-      (async () => {
-        try { await actionPromise; } catch {}
-        await page.waitForTimeout(2000);
-        return sniffedPath || null;
-      })()
+    const [download] = await Promise.all([
+      browserPage.waitForEvent('download', { timeout: 10000 }).catch(() => null),
+      browserPage.click(DOWNLOAD_BTN_SELECTOR, { delay: 50 })
     ]);
-    return result;
-  };
 
-  // 0) try the simple double-click first (some grids still use it)
-  let fp = await saveFromAction(textNode.dblclick({ delay: 40 }));
-  if (fp) return fp;
-  fp = await saveFromAction(row.dblclick({ delay: 40 }));
-  if (fp) return fp;
-
-  // 1) select the row via its checkbox
-  try { await row.hover(); } catch {}
-  const checkbox = row.locator('input[type="checkbox"], [role="checkbox"] input, [type="checkbox"]');
-  if (await checkbox.count() > 0) {
-    try { await checkbox.first().check({ force: true }); } catch { await checkbox.first().click({ force: true }); }
-  } else {
-    // some UIs select on single click anywhere on the row
-    try { await row.click({ delay: 30 }); } catch {}
-  }
-
-  // 2) click the top toolbar "Descargar/Download" (look in frame, then on the top page)
-  const findToolbarBtn = async (where) => {
-    const sel = [
-      'button:has-text("Descargar")',
-      'a:has-text("Descargar")',
-      '[title*="Descargar" i]',
-      'button:has-text("Download")',
-      'a:has-text("Download")',
-      '[title*="Download" i]',
-    ].join(',');
-    const btn = where.locator(sel).first();
-    return (await btn.count()) ? btn : null;
-  };
-
-  let btn = await findToolbarBtn(frameLike);
-  if (!btn) btn = await findToolbarBtn(page); // sometimes toolbar lives outside the list frame
-
-  if (btn) {
-    fp = await saveFromAction(btn.click({ delay: 40 }));
-    if (fp) return fp;
-  }
-
-  // 3) context-menu path: right-click row → "Descargar/Download"
-  try {
-    await row.click({ button: 'right' });
-    const ctx = frameLike.locator('text=/^(Descargar|Download)$/i').first();
-    if (await ctx.count()) {
-      fp = await saveFromAction(ctx.click({ delay: 40 }));
-      if (fp) return fp;
+    if (!download) {
+      throw new Error('Clicked download but no file captured (no download event / AJAX blob).');
     }
-  } catch {}
 
-  // 4) keyboard fallback (Enter)
-  try {
-    await row.focus();
-    fp = await saveFromAction(row.press('Enter'));
-    if (fp) return fp;
-  } catch {}
+    const path = await download.path();
+    const fileName = download.suggestedFilename() || 'file.csv';
+    const text = await download.createReadStream().then(streamToString);
+    await browserPage.close();
+    return { text, fileName };
+  }
 
-  return null;
+  await browserPage.close();
+  throw new Error('No CSV/XLSX links found. Adjust LINK_SELECTOR or provide DIRECT_CSV_URL (or set ROW_CHECKBOX_SELECTOR + DOWNLOAD_BTN_SELECTOR).');
 }
 
-
-
-  let saved = await clickByExactText(page);
-  if (!saved) {
-    for (const f of frames) {
-      if (f === page) continue;
-      saved = await clickByExactText(f);
-      if (saved) break;
-    }
-  }
-
-  if (!saved) {
-    await page.screenshot({ path: 'page.png', fullPage: true });
-    console.log('DEBUG_FILENAMES_BEGIN');
-    console.log(JSON.stringify({ tried: targetName, allNames }, null, 2));
-    console.log('DEBUG_FILENAMES_END');
-    await browser.close();
-    throw new Error('Clicked filename but no file captured (no download event and no AJAX blob).');
-  }
-
-  await browser.close();
-  return saved;
+function streamToString(stream) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    stream.setEncoding('utf8');
+    stream.on('data', chunk => (data += chunk));
+    stream.on('end', () => resolve(data));
+    stream.on('error', reject);
+  });
 }
 
-// ---- Main ----
+// ------------------------
+// Make posting
+// ------------------------
+async function postToMake(payload) {
+  const res = await fetch(MAKE_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Make webhook POST failed: ${res.status} ${t.slice(0, 400)}`);
+  }
+}
+
+// ------------------------
+// Main
+// ------------------------
 (async () => {
-  const filePath = await downloadForecast();
-  const hash = sha256File(filePath);
-  const ext = path.extname(filePath).toLowerCase();
+  const browser = await chromium.launch({ headless: HEADLESS });
+  const context = await browser.newContext();
 
-  let series = [];
   try {
-    series = (ext === '.csv') ? parseCSV_amil_wvpa(filePath) : parseExcelFlexible(filePath);
-  } catch (err) {
-    await fetch(MAKE_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        source: 'github_actions',
-        error: { message: String(err), stage: 'parse|schema' },
-        file_name: path.basename(filePath),
-        file_sha256: hash,
-        portal_url: PORTAL_URL,
-      }),
-    });
-    throw err;
-  }
+    // 1) Get CSV
+    let csvText = '';
+    let fileName = '';
 
-  const now = new Date();
-  const windowEnd = new Date(now.getTime() + HOURS_LOOKAHEAD * 3600 * 1000);
+    if (DIRECT_CSV_URL) {
+      ({ text: csvText, fileName } = await fetchCsvViaDirectUrl(context, DIRECT_CSV_URL));
+    } else {
+      ({ text: csvText, fileName } = await fetchCsvFromPortal(context));
+    }
 
-  const flagged = [];
-  const raw = [];
-  for (const r of series) {
-    const ts = new Date(r.ts_utc);
-    if (ts >= now && ts <= windowEnd) {
-      raw.push({ ts_utc: r.ts_utc, local: toLocalISO(ts, TIMEZONE), price: r.price });
-      if (r.price >= PRICE_THRESHOLD) {
-        flagged.push({ ts_utc: r.ts_utc, local: toLocalISO(ts, TIMEZONE), price: r.price });
+    console.log(`Chosen file: ${fileName}`);
+
+    // 2) Parse & normalize
+    const csv = parseCsv(csvText);
+    const normRows = normalizeRows(csv);
+
+    if (normRows.length === 0) {
+      throw new Error('Parsed 0 data rows (columns must include ts_utc/utc and price/value).');
+    }
+
+    // 3) Metrics / window
+    const rowsEvaluated = normRows.length;
+    const generatedAtUtc = nowIso();
+
+    // interval guess (minutes) from first two rows
+    let intervalMinutes = 0;
+    if (normRows.length > 1) {
+      const t0 = Date.parse(normRows[0].ts_utc);
+      const t1 = Date.parse(normRows[1].ts_utc);
+      if (isFinite(t0) && isFinite(t1) && t1 > t0) {
+        intervalMinutes = Math.round((t1 - t0) / 60000);
       }
     }
+
+    const windowStartUtc = normRows[0].ts_utc;
+    const windowEndUtc   = normRows[normRows.length - 1].ts_utc;
+
+    // 4) First 24 rows >= threshold
+    const first24Over = normRows.slice(0, 24).filter(r => Number(r.price) >= PRICE_THRESHOLD);
+
+    // 5) Build the lists
+    const listHeader = 'ts_utc, local, price';
+
+    const first24Text = first24Over.map(toLine).join('\n');
+
+    const fullListRaw = [listHeader, ...normRows.map(toLine)].join('\n');
+    const fullListMd  = '```\n' + clip(fullListRaw, MAX_TG_INLINE) + '\n```';
+
+    // 6) Hash & idempotency
+    const fileHash = sha256(csvText);
+    const idempotencyKey = fileHash; // stable per file
+
+    // 7) Build payload for Make
+    const payload = {
+      source: 'github_actions',
+      idempotency_key: idempotencyKey,
+      file_name: fileName,
+      file_sha256: fileHash,
+      portal_url: PORTAL_URL || DIRECT_CSV_URL || '',
+      sheet: SHEET_NAME,
+      timezone: TIMEZONE_LABEL,
+      generated_at_utc: generatedAtUtc,
+      window_start_utc: windowStartUtc,
+      window_end_utc: windowEndUtc,
+      threshold: PRICE_THRESHOLD,
+      interval_minutes: intervalMinutes,
+      rows_evaluated: rowsEvaluated,
+
+      // your raw data if Make needs it
+      raw_intervals: normRows,            // array of { ts_utc, local, price }
+
+      // NEW fields for Telegram
+      first24_count: first24Over.length,  // number of first-24 rows above threshold
+      first24_text: first24Text,          // plain list of those lines
+      full_list_text: fullListRaw,        // full CSV-as-lines (for file upload)
+      full_list_text_md: fullListMd,      // Markdown code block (inline message)
+    };
+
+    // 8) flagged (to keep your existing filters in Make working)
+    //    We'll include "flagged" as an array of the first-24 hits:
+    payload.flagged = first24Over.map(r => ({ ts_utc: r.ts_utc, local: r.local, price: r.price }));
+
+    // 9) POST to Make
+    await postToMake(payload);
+
+    console.log(`posted to Make: flagged=${payload.flagged.length}, rows=${rowsEvaluated}`);
+  } catch (err) {
+    console.error('Error:', err?.message || err);
+    process.exit(1);
+  } finally {
+    await context.close();
+    await browser.close();
   }
-
-  const lastTs = series.length ? series[series.length - 1].ts_utc : toISOZ(now);
-  const payload = {
-    source: 'github_actions',
-    idempotency_key: `${hash}_amilwvpa_${Date.parse(lastTs) / 1000}`,
-    file_name: path.basename(filePath),
-    file_sha256: hash,
-    portal_url: PORTAL_URL,
-    sheet: 'AMIL.WVPA',
-    timezone: TIMEZONE,
-    generated_at_utc: toISOZ(now),
-    window_start_utc: toISOZ(now),
-    window_end_utc: toISOZ(windowEnd),
-    threshold: PRICE_THRESHOLD,
-    interval_minutes: 60,
-    rows_evaluated: series.length,
-    flagged,
-    raw_intervals: raw,
-    notes: ['clicked newest filename; supports native & AJAX downloads'],
-  };
-
-  await fetch(MAKE_WEBHOOK_URL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-
-  console.log(`posted to Make: flagged=${flagged.length}, rows=${series.length}`);
-})().catch(e => { console.error(e); process.exit(1); });
+})();
