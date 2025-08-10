@@ -87,12 +87,149 @@ async function downloadForecast() {
   const tmpDir = '/tmp/condor_dl';
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  if (DIRECT_CSV_URL) {
-    const fn = path.join(tmpDir, DIRECT_CSV_URL.split('/').pop() || 'download.csv');
-    const res = await fetch(DIRECT_CSV_URL);
-    fs.writeFileSync(fn, Buffer.from(await res.arrayBuffer()));
-    return fn;
+  // 1) Launch browser and login (we always go through the UI so cookies/session apply)
+  const browser = await chromium.launch({ headless: true });
+  const ctx = await browser.newContext({ acceptDownloads: true });
+  const page = await ctx.newPage();
+
+  await page.goto(PORTAL_URL, { waitUntil: 'domcontentloaded', timeout: 120000 });
+
+  if (USERNAME && PASSWORD) {
+    try {
+      await page.waitForSelector("input[type='text'], input[name='username'], #username", { timeout: 8000 });
+      // Fill the first visible username/password fields we find
+      const userField = await page.$("input[type='text'], input[name='username'], #username");
+      const passField = await page.$("input[type='password'], #password");
+      if (userField && passField) {
+        await userField.fill(USERNAME);
+        await passField.fill(PASSWORD);
+        const btn = await page.$("button[type='submit'], input[type='submit'], button:has-text('Log in'), button:has-text('Sign in')");
+        if (btn) await btn.click();
+      }
+      await page.waitForLoadState('networkidle', { timeout: 120000 });
+    } catch { /* login UI may be different; continue */ }
   }
+
+  // 2) Prepare two ways to capture files:
+  //    A) "download" event (browser native download)
+  //    B) Network response sniff (AJAX -> CSV/XLSX blob)
+  let sniffedPath = null;
+  page.on('response', async (resp) => {
+    try {
+      const headers = resp.headers();
+      const ct = (headers['content-type'] || '').toLowerCase();
+      const cd = headers['content-disposition'] || '';
+      const looksFile =
+        ct.includes('text/csv') ||
+        ct.includes('application/vnd.ms-excel') ||
+        ct.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+
+      if (looksFile) {
+        const body = await resp.body();
+        const m = /filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i.exec(cd);
+        const nameGuess =
+          decodeURIComponent((m && (m[1] || m[2])) || '')
+            || ('download' + (ct.includes('csv') ? '.csv' : '.xlsx'));
+        const fp = path.join(tmpDir, nameGuess);
+        fs.writeFileSync(fp, body);
+        sniffedPath = fp;
+      }
+    } catch { /* ignore sniff errors */ }
+  });
+
+  await page.waitForTimeout(1500);
+
+  // 3) If there ARE anchors for CSV/XLSX, prefer them.
+  const anchors = await page.$$eval("a", els =>
+    els.map(a => ({ href: a.getAttribute('href'), text: (a.textContent || '').trim() })));
+  const linkCandidates = (anchors || [])
+    .filter(l => l.href && /\.(csv|xlsx)$/i.test(l.href));
+
+  if (linkCandidates.length > 0) {
+    // try best-ranked first
+    linkCandidates.sort((a,b) => {
+      const score = (x) =>
+        (/(forecast|fcst)/i.test(x.href) ? 1 : 0) +
+        (/(AMIL\.WVPA)/i.test(x.href) ? 1 : 0) +
+        (/(forecast|fcst)/i.test(x.text) ? 1 : 0);
+      return score(b) - score(a);
+    });
+    const target = linkCandidates[0];
+
+    // Either native download event or direct fetch fallback
+    try {
+      const [dl] = await Promise.all([
+        page.waitForEvent('download', { timeout: 30000 }),
+        page.evaluate((href) => { window.location.href = href; }, target.href)
+      ]);
+      const fp = path.join(tmpDir, await dl.suggestedFilename());
+      await dl.saveAs(fp);
+      await browser.close();
+      return fp;
+    } catch {
+      // click didn’t emit download; try navigate & save body
+      const resp = await page.goto(target.href, { timeout: 60000 });
+      const buf = await resp.body();
+      const name = target.href.split('/').pop() || 'download.csv';
+      const fp = path.join(tmpDir, name);
+      fs.writeFileSync(fp, buf);
+      await browser.close();
+      return fp;
+    }
+  }
+
+  // 4) No anchors → try common buttons/menus that trigger export
+  const clickSelectors = [
+    'text=/\\bCSV\\b/i',
+    'text=/\\bExcel\\b/i',
+    'text=/Download/i',
+    'text=/Export/i',
+    'button:has-text("CSV")',
+    'button:has-text("Excel")',
+    '[class*="download" i]',
+    '[title*="CSV" i]',
+    '[role="button"]:has-text("CSV")',
+  ];
+
+  for (const sel of clickSelectors) {
+    const els = await page.$$(sel);
+    for (let i = 0; i < Math.min(3, els.length); i++) {
+      try {
+        const [maybeDl] = await Promise.allSettled([
+          page.waitForEvent('download', { timeout: 15000 }),
+          els[i].click({ delay: 50 }).catch(()=>{})
+        ]);
+
+        // if native download fired
+        if (maybeDl.status === 'fulfilled' && maybeDl.value) {
+          const fp = path.join(tmpDir, await maybeDl.value.suggestedFilename());
+          await maybeDl.value.saveAs(fp);
+          await browser.close();
+          return fp;
+        }
+
+        // otherwise, give network sniff a moment
+        await page.waitForTimeout(2000);
+        if (sniffedPath) {
+          await browser.close();
+          return sniffedPath;
+        }
+      } catch { /* try next */ }
+    }
+    if (sniffedPath) break;
+  }
+
+  // 5) Final debug (so we can tailor selectors quickly)
+  await page.screenshot({ path: 'page.png', fullPage: true });
+  const firstAnchors = anchors.slice(0, 100);
+  console.log('DEBUG_ANCHORS_BEGIN');
+  console.log(JSON.stringify(firstAnchors, null, 2));
+  console.log('DEBUG_ANCHORS_END');
+
+  await browser.close();
+  throw new Error('No CSV/XLSX links or export buttons yielded a file. See DEBUG output and screenshot artifact.');
+}
+
 
   const browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext({ acceptDownloads: true });
