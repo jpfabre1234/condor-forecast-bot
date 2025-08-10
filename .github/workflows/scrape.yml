@@ -1,0 +1,27 @@
+name: Condor Forecast Bot
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: node scrape.js
+        env:
+          PORTAL_URL: ${{ secrets.PORTAL_URL }}
+          USERNAME:   ${{ secrets.USERNAME }}
+          PASSWORD:   ${{ secrets.PASSWORD }}
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+          TIMEZONE: America/Chicago
+          PRICE_THRESHOLD: "80"
+          HOURS_LOOKAHEAD: "6"
+          FILE_REGEX: "AMIL\\.WVPA.*(forecast|fcst).*(csv|xlsx)$"
+          LINK_SELECTOR: "a[href$='.csv'], a[href$='.xlsx']"
