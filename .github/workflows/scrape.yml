@@ -16,17 +16,20 @@ jobs:
         with:
           node-version: 20
 
-      # No "npm ci" — not needed
+      # Install the Playwright **package** so require('playwright') works
+      - name: Install Playwright package
+        run: npm i playwright --silent
 
+      # Install Chromium + OS deps
       - name: Install Playwright (Chromium)
         run: npx playwright install --with-deps chromium
 
       - name: Run node scrape.cjs
         env:
-          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}  # <- set in repo secrets
-          PORTAL_URL:       ${{ secrets.PORTAL_URL }}        # <- set in repo secrets
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+          PORTAL_URL:       ${{ secrets.PORTAL_URL }}
 
-          # Optional overrides (defaults already in your script):
+          # Optional overrides
           TIMEZONE: America/Chicago
           SHEET_NAME: AMIL.WVPA
           PRICE_THRESHOLD: '80'
@@ -34,5 +37,5 @@ jobs:
           ROW_SELECTOR: 'table tbody tr'
           ROW_CHECKBOX_SELECTOR: 'input[type="checkbox"]'
           DOWNLOAD_BTN_SELECTOR: 'button:has-text("Descargar"), [aria-label="Descargar"]'
-          DEBUG_SELECTORS: '0'   # set to '1' to print row counts and timestamps
+          DEBUG_SELECTORS: '0'
         run: node scrape.cjs
