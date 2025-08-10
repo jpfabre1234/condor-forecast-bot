@@ -1,0 +1,10 @@
+{
+  "name": "condor-forecast-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "playwright": "^1.46.0",
+    "xlsx": "^0.18.5",
+    "node-fetch": "^3.3.2"
+  }
+}
