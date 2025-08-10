@@ -1,38 +1,37 @@
 name: Condor Forecast Bot
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
-    # ⬇️ Add/merge this block
     env:
-      MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}   # set as a Secret (see step 3)
-      PORTAL_URL:       ${{ secrets.PORTAL_URL }}         # set as a Secret (see step 3)
-
-      # Selectors (adjust only if your portal’s DOM is different)
-      ROW_SELECTOR: 'table tbody tr'
-      ROW_CHECKBOX_SELECTOR: 'input[type="checkbox"]'
-      DOWNLOAD_BTN_SELECTOR: 'button:has-text("Descargar"), [aria-label="Descargar"]'
-
-      # Parsing / formatting
-      PRICE_THRESHOLD: '80'
-      MAX_ROWS: '48'
-      TIMEZONE: 'America/Chicago'
-      SHEET_NAME: 'AMIL.WVPA'
-
-      # Debug logs for selector counts
-      DEBUG_SELECTORS: '1'
+      # keep these mapped to your repo secrets (adjust names if yours differ)
+      ACES_PORTAL_URL:       ${{ secrets.ACES_PORTAL_URL }}
+      ACES_USERNAME:         ${{ secrets.ACES_USERNAME }}
+      ACES_PASSWORD:         ${{ secrets.ACES_PASSWORD }}
+      MAKE_WEBHOOK_URL:      ${{ secrets.MAKE_WEBHOOK_URL }}
+      DIRECT_CSV_URL:        ${{ secrets.DIRECT_CSV_URL }}          # optional
+      ROW_CHECKBOX_SELECTOR: ${{ secrets.ROW_CHECKBOX_SELECTOR }}   # optional
+      DOWNLOAD_BTN_SELECTOR: ${{ secrets.DOWNLOAD_BTN_SELECTOR }}   # optional
+      PRICE_THRESHOLD:       ${{ secrets.PRICE_THRESHOLD }}         # e.g. 80
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - run: npm ci
+      # ⬇️ No lockfile needed; just install the one dependency
+      - name: Install deps
+        run: npm install playwright@^1.46.0
 
       - name: Install Playwright (with Chromium)
         run: npx playwright install --with-deps chromium
