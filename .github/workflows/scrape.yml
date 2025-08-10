@@ -1,27 +1,41 @@
 name: Condor Forecast Bot
+
 on:
-  schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
+    # ⬇️ Add/merge this block
+    env:
+      MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}   # set as a Secret (see step 3)
+      PORTAL_URL:       ${{ secrets.PORTAL_URL }}         # set as a Secret (see step 3)
+
+      # Selectors (adjust only if your portal’s DOM is different)
+      ROW_SELECTOR: 'table tbody tr'
+      ROW_CHECKBOX_SELECTOR: 'input[type="checkbox"]'
+      DOWNLOAD_BTN_SELECTOR: 'button:has-text("Descargar"), [aria-label="Descargar"]'
+
+      # Parsing / formatting
+      PRICE_THRESHOLD: '80'
+      MAX_ROWS: '48'
+      TIMEZONE: 'America/Chicago'
+      SHEET_NAME: 'AMIL.WVPA'
+
+      # Debug logs for selector counts
+      DEBUG_SELECTORS: '1'
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm install
-      - run: npx playwright install --with-deps chromium
-      - run: node scrape.js
-        env:
-          PORTAL_URL: ${{ secrets.PORTAL_URL }}
-          USERNAME:   ${{ secrets.USERNAME }}
-          PASSWORD:   ${{ secrets.PASSWORD }}
-          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
-          TIMEZONE: America/Chicago
-          PRICE_THRESHOLD: "80"
-          HOURS_LOOKAHEAD: "6"
-          FILE_REGEX: "AMIL\\.WVPA.*(forecast|fcst).*(csv|xlsx)$"
-          LINK_SELECTOR: "a[href$='.csv'], a[href$='.xlsx']"
+
+      - run: npm ci
+
+      - name: Install Playwright (with Chromium)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run node scrape.js
+        run: node scrape.js
