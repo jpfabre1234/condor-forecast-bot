@@ -186,92 +186,93 @@ async function downloadForecast() {
 
   // 5) Click that exact text; capture native download or sniffed blob
  async function clickByExactText(frameLike) {
-  // exact text node
   const name = targetName;
-  const textNode = frameLike.locator(`xpath=//*[normalize-space(text())="${name}"]`).first();
+
+  // find the text node (allowing extra whitespace/icon text)
+  const textNode = frameLike.locator(`xpath=//*[contains(normalize-space(.),"${name}")]`).first();
   if (await textNode.count() === 0) return null;
 
-  // try to act on the row that contains the text (table row or role=row)
-  const row = textNode.locator('xpath=ancestor-or-self::*[self::tr or @role="row" or contains(@class,"row")][1]');
+  // closest row-like container
+  const row = textNode.locator(
+    'xpath=ancestor-or-self::*[self::tr or @role="row" or contains(@class,"row") or contains(@class,"file")][1]'
+  );
 
-  // 1) double-click (many file grids use this to download)
-  try {
-    const [dl] = await Promise.all([
-      page.waitForEvent('download', { timeout: 20000 }),
-      row.dblclick({ delay: 50 })
-    ]);
-    const fp = path.join('/tmp/condor_dl', await dl.suggestedFilename());
-    await dl.saveAs(fp);
-    return fp;
-  } catch { /* continue */ }
-
-  // 2) single-click to select, then click a visible Download/Descargar button
-  try {
-    await row.click({ delay: 30 });
-    const maybeDownloadBtn = frameLike.locator(
-      [
-        'button:has-text("Descargar")',
-        'button:has-text("Download")',
-        '[aria-label*="Descargar" i]',
-        '[aria-label*="Download" i]',
-        'text=/^Descargar$/i',
-        'text=/^Download$/i'
-      ].join(',')
-    ).first();
-
-    if (await maybeDownloadBtn.isVisible({ timeout: 1000 })) {
-      const [dl] = await Promise.allSettled([
-        page.waitForEvent('download', { timeout: 20000 }),
-        maybeDownloadBtn.click({ delay: 40 })
-      ]);
-      if (dl.status === 'fulfilled' && dl.value) {
-        const fp = path.join('/tmp/condor_dl', await dl.value.suggestedFilename());
-        await dl.value.saveAs(fp);
+  // helper: wait for native download or fallback to sniffed AJAX
+  const saveFromAction = async (actionPromise) => {
+    const result = await Promise.race([
+      (async () => {
+        const dl = await page.waitForEvent('download', { timeout: 20000 });
+        const fp = path.join('/tmp/condor_dl', await dl.suggestedFilename());
+        await dl.saveAs(fp);
         return fp;
-      }
-      // give network-sniff a moment (AJAX blob case)
-      await page.waitForTimeout(2000);
-      if (sniffedPath) return sniffedPath;
-    }
-  } catch { /* continue */ }
+      })(),
+      (async () => {
+        try { await actionPromise; } catch {}
+        await page.waitForTimeout(2000);
+        return sniffedPath || null;
+      })()
+    ]);
+    return result;
+  };
 
-  // 3) context-menu → Descargar/Download
+  // 0) try the simple double-click first (some grids still use it)
+  let fp = await saveFromAction(textNode.dblclick({ delay: 40 }));
+  if (fp) return fp;
+  fp = await saveFromAction(row.dblclick({ delay: 40 }));
+  if (fp) return fp;
+
+  // 1) select the row via its checkbox
+  try { await row.hover(); } catch {}
+  const checkbox = row.locator('input[type="checkbox"], [role="checkbox"] input, [type="checkbox"]');
+  if (await checkbox.count() > 0) {
+    try { await checkbox.first().check({ force: true }); } catch { await checkbox.first().click({ force: true }); }
+  } else {
+    // some UIs select on single click anywhere on the row
+    try { await row.click({ delay: 30 }); } catch {}
+  }
+
+  // 2) click the top toolbar "Descargar/Download" (look in frame, then on the top page)
+  const findToolbarBtn = async (where) => {
+    const sel = [
+      'button:has-text("Descargar")',
+      'a:has-text("Descargar")',
+      '[title*="Descargar" i]',
+      'button:has-text("Download")',
+      'a:has-text("Download")',
+      '[title*="Download" i]',
+    ].join(',');
+    const btn = where.locator(sel).first();
+    return (await btn.count()) ? btn : null;
+  };
+
+  let btn = await findToolbarBtn(frameLike);
+  if (!btn) btn = await findToolbarBtn(page); // sometimes toolbar lives outside the list frame
+
+  if (btn) {
+    fp = await saveFromAction(btn.click({ delay: 40 }));
+    if (fp) return fp;
+  }
+
+  // 3) context-menu path: right-click row → "Descargar/Download"
   try {
     await row.click({ button: 'right' });
-    const ctxItem = frameLike.locator('text=/^(Descargar|Download)$/i').first();
-    if (await ctxItem.isVisible({ timeout: 1000 })) {
-      const [dl] = await Promise.allSettled([
-        page.waitForEvent('download', { timeout: 20000 }),
-        ctxItem.click({ delay: 40 })
-      ]);
-      if (dl.status === 'fulfilled' && dl.value) {
-        const fp = path.join('/tmp/condor_dl', await dl.value.suggestedFilename());
-        await dl.value.saveAs(fp);
-        return fp;
-      }
-      await page.waitForTimeout(2000);
-      if (sniffedPath) return sniffedPath;
+    const ctx = frameLike.locator('text=/^(Descargar|Download)$/i').first();
+    if (await ctx.count()) {
+      fp = await saveFromAction(ctx.click({ delay: 40 }));
+      if (fp) return fp;
     }
-  } catch { /* continue */ }
+  } catch {}
 
-  // 4) keyboard Enter on the row
+  // 4) keyboard fallback (Enter)
   try {
     await row.focus();
-    const [dl] = await Promise.allSettled([
-      page.waitForEvent('download', { timeout: 15000 }),
-      row.press('Enter')
-    ]);
-    if (dl.status === 'fulfilled' && dl.value) {
-      const fp = path.join('/tmp/condor_dl', await dl.value.suggestedFilename());
-      await dl.value.saveAs(fp);
-      return fp;
-    }
-    await page.waitForTimeout(2000);
-    if (sniffedPath) return sniffedPath;
+    fp = await saveFromAction(row.press('Enter'));
+    if (fp) return fp;
   } catch {}
 
   return null;
 }
+
 
 
   let saved = await clickByExactText(page);
