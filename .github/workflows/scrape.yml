@@ -16,26 +16,28 @@ jobs:
         with:
           node-version: 20
 
-      # Install the Playwright **package** so require('playwright') works
+      # ✅ Install the npm package so `require('playwright')` works
       - name: Install Playwright package
-        run: npm i playwright --silent
+        run: npm i playwright@^1.47 --no-audit --no-fund --silent
 
-      # Install Chromium + OS deps
+      # ✅ Install the browser + OS deps
       - name: Install Playwright (Chromium)
         run: npx playwright install --with-deps chromium
+
+      # (Optional) quick proof that the package is installed
+      - name: Verify playwright is resolvable
+        run: node -e "console.log(require.resolve('playwright'))"
 
       - name: Run node scrape.cjs
         env:
           MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
           PORTAL_URL:       ${{ secrets.PORTAL_URL }}
-
-          # Optional overrides
           TIMEZONE: America/Chicago
           SHEET_NAME: AMIL.WVPA
           PRICE_THRESHOLD: '80'
           MAX_ROWS: '48'
           ROW_SELECTOR: 'table tbody tr'
           ROW_CHECKBOX_SELECTOR: 'input[type="checkbox"]'
-          DOWNLOAD_BTN_SELECTOR: 'button:has-text("Descargar"), [aria-label="Descargar"]'
+          DOWNLOAD_BTN_SELECTOR: 'button:has-text(\"Descargar\"), [aria-label=\"Descargar\"]'
           DEBUG_SELECTORS: '0'
         run: node scrape.cjs
