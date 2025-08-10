@@ -87,28 +87,135 @@ async function downloadForecast() {
   const tmpDir = '/tmp/condor_dl';
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  // 1) Launch browser and login (we always go through the UI so cookies/session apply)
   const browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext({ acceptDownloads: true });
   const page = await ctx.newPage();
 
+  // 1) Login
   await page.goto(PORTAL_URL, { waitUntil: 'domcontentloaded', timeout: 120000 });
-
   if (USERNAME && PASSWORD) {
     try {
       await page.waitForSelector("input[type='text'], input[name='username'], #username", { timeout: 8000 });
-      // Fill the first visible username/password fields we find
-      const userField = await page.$("input[type='text'], input[name='username'], #username");
-      const passField = await page.$("input[type='password'], #password");
-      if (userField && passField) {
-        await userField.fill(USERNAME);
-        await passField.fill(PASSWORD);
-        const btn = await page.$("button[type='submit'], input[type='submit'], button:has-text('Log in'), button:has-text('Sign in')");
-        if (btn) await btn.click();
-      }
+      await page.fill("input[type='text'], input[name='username'], #username", USERNAME);
+      await page.fill("input[type='password'], #password", PASSWORD);
+      const btn = await page.$("button[type='submit'], input[type='submit'], button:has-text('Log in'), button:has-text('Sign in')");
+      if (btn) await btn.click();
       await page.waitForLoadState('networkidle', { timeout: 120000 });
-    } catch { /* login UI may be different; continue */ }
+    } catch { /* continue even if login UI differs */ }
   }
+
+  // 2) Sniff AJAX file responses (CSV/XLSX) as a fallback
+  let sniffedPath = null;
+  page.on('response', async (resp) => {
+    try {
+      const headers = resp.headers();
+      const ct = (headers['content-type'] || '').toLowerCase();
+      const cd = headers['content-disposition'] || '';
+      const ajaxFile =
+        ct.includes('text/csv') ||
+        ct.includes('application/vnd.ms-excel') ||
+        ct.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      if (!ajaxFile) return;
+      const body = await resp.body();
+      const m = /filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i.exec(cd);
+      const guessed = decodeURIComponent((m && (m[1] || m[2])) || 'download.csv');
+      const fp = path.join(tmpDir, guessed);
+      fs.writeFileSync(fp, body);
+      sniffedPath = fp;
+    } catch {}
+  });
+
+  await page.waitForTimeout(1500);
+
+  // 3) Gather visible filenames from the main page and any iframes
+  const fileRe = /AMIL\.WVPA_rt_price_forecast_(\d{14})\.csv$/i;
+
+  async function listNamesOn(frame) {
+    // collect candidate texts quickly
+    const texts = await frame.$$eval('a, [role="link"], .file-name, td, span, div', els =>
+      Array.from(new Set(
+        els.map(e => (e.textContent || '').trim())
+           .filter(t => /AMIL\.WVPA_rt_price_forecast_\d{14}\.csv$/i.test(t))
+      ))
+    );
+    return texts;
+  }
+
+  // include main page + all child frames
+  const frames = [page, ...page.frames().filter(f => f !== page)];
+  let allNames = [];
+  for (const f of frames) {
+    try { allNames = allNames.concat(await listNamesOn(f)); } catch {}
+  }
+  allNames = Array.from(new Set(allNames));
+
+  // If none, debug and bail
+  if (allNames.length === 0) {
+    await page.screenshot({ path: 'page.png', fullPage: true });
+    console.log('DEBUG_FILENAMES_BEGIN');
+    console.log(JSON.stringify({ frames: frames.length, names: allNames }, null, 2));
+    console.log('DEBUG_FILENAMES_END');
+    await browser.close();
+    throw new Error('Could not find any AMIL.WVPA_rt_price_forecast_YYYYMMDDHHMMSS.csv text on the page.');
+  }
+
+  // 4) Pick newest by timestamp in filename
+  allNames.sort((a, b) => {
+    const ma = a.match(fileRe), mb = b.match(fileRe);
+    const na = ma ? Number(ma[1]) : 0;
+    const nb = mb ? Number(mb[1]) : 0;
+    return nb - na; // newest first
+  });
+  const targetName = allNames[0];
+  console.log(`Chosen file: ${targetName}`);
+
+  // 5) Click that exact text in any frame; capture native download or AJAX sniff
+  let gotPath = null;
+
+  // try native download first
+  const tryClickIn = async (f) => {
+    const loc = f.getByText(targetName, { exact: true });
+    if (await loc.count() === 0) return false;
+
+    try {
+      const [dl] = await Promise.all([
+        page.waitForEvent('download', { timeout: 30000 }),
+        loc.first().click({ delay: 50 })
+      ]);
+      const fp = path.join(tmpDir, await dl.suggestedFilename());
+      await dl.saveAs(fp);
+      gotPath = fp;
+      return true;
+    } catch {
+      // maybe no native download; give sniff a moment
+      await loc.first().click({ delay: 50 }).catch(()=>{});
+      await page.waitForTimeout(2000);
+      if (sniffedPath) { gotPath = sniffedPath; return true; }
+      return false;
+    }
+  };
+
+  // try main page then frames
+  if (!(await tryClickIn(page))) {
+    for (const f of frames) {
+      if (f === page) continue;
+      if (await tryClickIn(f)) break;
+    }
+  }
+
+  if (!gotPath) {
+    await page.screenshot({ path: 'page.png', fullPage: true });
+    console.log('DEBUG_FILENAMES_BEGIN');
+    console.log(JSON.stringify({ tried: targetName, allNames }, null, 2));
+    console.log('DEBUG_FILENAMES_END');
+    await browser.close();
+    throw new Error('Tried clicking the filename but no file was captured (no download event and no AJAX blob).');
+  }
+
+  await browser.close();
+  return gotPath;
+}
+
 
   // 2) Prepare two ways to capture files:
   //    A) "download" event (browser native download)
